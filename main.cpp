@@ -1,3 +1,4 @@
+// #include <Accelerate/Accelerate.h>
 #include <arm_neon.h>
 #include <omp.h>
 
@@ -9,7 +10,27 @@
 #include "timer.h"
 #include "utilities.h"
 
-using simd_matrix_t = float16_t (&)[MATRIX_SIZE / 8][MATRIX_SIZE / 8][8][8];
+// TODO: make a struct to organize these
+float *x;
+
+float *k_cache;
+float *v_cache;
+
+int n_heads;
+int n_kv_heads;
+int kqv_dim;
+int embed_dim;
+
+int pos;
+
+float *q_w;
+float *k_w;
+float *v_w;
+float *wo;
+
+float *q;
+float *kq;
+float *z;
 
 void print(float16_t *x, int d, int n) {
     for (int i = 0; i < d; i++) {
@@ -20,62 +41,169 @@ void print(float16_t *x, int d, int n) {
     }
 }
 
-void matmul_simd2(simd_matrix_t w, float16_t *x, float16_t *x_out, int d, int n) {
-    int BLOCKSIZE = 8;
+// TODO: simd :)
+void inplace_swish(float *x, float b, int d) {
 #pragma omp parallel for
-    for (int i = 0; i < d / BLOCKSIZE; i++) {
-        float16x8_t v_out = vdupq_n_f16(0.);
-        for (int j = 0; j < n / BLOCKSIZE; j++) {
-            for (int ii = 0; ii < BLOCKSIZE; ii++) {
-                v_out = vfmaq_f16(v_out, vld1q_f16((float16_t *)&w[i][j][ii]), vdupq_n_f16(x[j * BLOCKSIZE + ii]));
-            }
-        }
-        vst1q_f16(&x_out[i * BLOCKSIZE], v_out);
-    }
+    for (int i = 0; i < d; i++)
+        x[i] = x[i] / (1 + expf(-x[i] * b));
 }
 
-void matmul_simd(float16_t *w, float16_t *x, float16_t *x_out, int d, int n) {
-    int BLOCKSIZE = 8;
+// TODO: simd :)
+void inplace_rms_norm(float *x, float *w, int d) {
+    float rms = 0.0;
+#pragma omp parallel for reduction(+ : rms)
+    for (int i = 0; i < d; i++)
+        rms += x[i] * x[i];
+
+    rms = sqrt(rms / d);
+
 #pragma omp parallel for
-    for (int j = 0; j < d / BLOCKSIZE; j++) {
-        float16x8_t v_out = vdupq_n_f32(0.0);
-
-        for (int i = 0; i < n / BLOCKSIZE; i++) {
-            // float32x4_t v_out = vld1q_f32(&x_out[j * BLOCKSIZE]);
-
-            for (int ii = 0; ii < BLOCKSIZE; ii++) {
-                float16x8_t v1 = vld1q_f16(&w[i * d * BLOCKSIZE + ii * d + j * BLOCKSIZE]);
-                float16x8_t v2 = vdupq_n_f16(x[i * BLOCKSIZE + ii]);
-                v_out = vfmaq_f16(v_out, v1, v2);
-            }
-
-            // vst1q_f32(&x_out[j * BLOCKSIZE], v_out);
-        }
-
-        vst1q_f16(&x_out[j * BLOCKSIZE], v_out);
-    }
+    for (int i = 0; i < d; i++)
+        x[i] *= w[i] / rms;
 }
 
-void matmul_improved(float16_t *w, float16_t *x, float16_t *x_out, int d, int n) {
-    int BLOCKSIZE = 8;
+void inplace_softmax(float *x, int d) {
+    float sum = 0.0;
+#pragma omp parallel for reduction(+ : sum)
+    for (int i = 0; i < d; i++) {
+        x[i] = expf(x[i]);
+        sum += x[i];
+    }
+
 #pragma omp parallel for
-    for (int i = 0; i < d / BLOCKSIZE; i++)
-        for (int j = 0; j < n / BLOCKSIZE; j++)
-            for (int ii = 0; ii < BLOCKSIZE; ii++)
-                for (int jj = 0; jj < BLOCKSIZE; jj++)
-                    x_out[i * BLOCKSIZE + ii] += w[i * n * BLOCKSIZE + ii * n + j * BLOCKSIZE + jj] * x[j * BLOCKSIZE + jj];
+    for (int i = 0; i < d; i++) {
+        x[i] /= sum;
+    }
 }
 
 // w (d, n) @ x (n) = xout (d)
-void matmul_truth(float16_t *w, float16_t *x, float16_t *x_out, int d, int n) {
+void b_matvec(float *w, float *x, float *x_out, int d, int n) {
+    int BLOCKSIZE = 4;
 #pragma omp parallel for
-    for (int i = 0; i < d; i++) {
-        float16_t val = 0;
-        for (int j = 0; j < n; j++) {
-            val += w[i * n + j] * x[j];
+    for (int i = 0; i < d / BLOCKSIZE; i++) {
+        float32x4_t v_out = vdupq_n_f32(0.);
+        for (int j = 0; j < n / BLOCKSIZE; j++) {
+            for (int ii = 0; ii < BLOCKSIZE; ii++) {
+                float32x4_t v1 = vld1q_f32((float *)&w[i * n * BLOCKSIZE * BLOCKSIZE + j * BLOCKSIZE * BLOCKSIZE + ii * BLOCKSIZE]);
+                float32x4_t v2 = vdupq_n_f32(x[j * BLOCKSIZE + ii]);
+                v_out = vfmaq_f32(v_out, v1, v2);
+            }
         }
-        x_out[i] = val;
+        vst1q_f32(&x_out[i * BLOCKSIZE], v_out);
     }
+}
+
+/*
+void matmul_cblas(const float *A, const float *B, float *C, const int m, const int n) {
+    // Leading dimensions of the matrices
+    int lda = m;  // Since A is m-by-k and not transposed
+    int incX = 1;
+    int incY = 1;
+
+    // Scalar multipliers (alpha and beta)
+    float alpha = 1.0;  // Multiplier for the matrices A and B
+    float beta = 0.0;   // Multiplier for matrix C
+
+    // Perform the matrix multiplication: C = alpha*A*B + beta*C
+    cblas_sgemv(CblasRowMajor, CblasNoTrans,
+                m, n,
+                alpha, A, lda,
+                B, incX,
+                beta, C, incY);
+}
+*/
+
+void inplace_rope(float *x, int pos, int dim) {
+    // TODO: maybe can precalculate power (theta)
+    for (int i = 0; i < dim; i += 2) {
+        // is there supposed to be a -2 in the exponent?
+        float theta = powf(10000.0, -2 * i / (float)dim);
+        float val = pos * theta;
+        x[i] = x[i] * cosf(val) - x[i + 1] * sinf(val);
+        x[i + 1] = x[i + 1] * cosf(val) - x[i] * sinf(val);
+    }
+}
+
+// TODO: current implementation is does not support GQA
+void kq_mul_softmax_fused(float *q, float *k_cache, float *kq, int n_heads, int n_kv_heads, int pos, int kqv_dim) {
+    // q heads per kv head
+    // int kv_head_ratio = n_heads / n_kv_heads;
+
+    using q_matrix_t = float(&)[n_heads][kqv_dim];
+    using k_matrix_t = float(&)[pos][n_heads][kqv_dim];
+    using kq_matrix_t = float(&)[n_heads][pos];
+
+    q_matrix_t q_m = reinterpret_cast<q_matrix_t>(*q);
+    k_matrix_t k_m = reinterpret_cast<k_matrix_t>(*k_cache);
+    kq_matrix_t kq_m = reinterpret_cast<kq_matrix_t>(*kq);
+
+    float sqrt_d = sqrtf((float)kqv_dim);
+
+    // TODO: add simd
+    // no sequential i/o on k_cache but fused operation (need to test performance)
+#pragma omp parallel for
+    for (int i = 0; i < n_heads; i++) {
+        float sum = 0.0;
+        for (int pos_index = 0; pos_index < pos; pos_index++) {
+            for (int j = 0; j < kqv_dim; j++) {
+                kq_m[pos_index][i] += q_m[i][j] * k_m[pos_index][i][j];
+            }
+            kq_m[i][pos_index] = expf(kq_m[i][pos_index] / sqrt_d);
+            sum += kq_m[i][pos_index];
+        }
+        for (int pos_index = 0; pos_index < pos; pos_index++) {
+            kq_m[i][pos_index] /= sum;
+        }
+    }
+}
+
+// TODO: current implementation is does not support GQA
+void scale_v_mul(float *kq, float *v_cache, float *z, int n_heads, int n_kv_heads, int pos, int kqv_dim) {
+    // q heads per kv head
+    // int kv_head_ratio = n_heads / n_kv_heads;
+
+    using kq_matrix_t = float(&)[n_heads][pos];
+    using v_matrix_t = float(&)[pos][n_heads][kqv_dim];
+    using z_matrix_t = float(&)[n_heads][kqv_dim];
+
+    kq_matrix_t kq_m = reinterpret_cast<kq_matrix_t>(*kq);
+    v_matrix_t v_m = reinterpret_cast<v_matrix_t>(*v_cache);
+    z_matrix_t z_m = reinterpret_cast<z_matrix_t>(*z);
+
+    float sqrt_d = sqrtf((float)kqv_dim);
+
+    // TODO: add simd
+    // this can be potentially blocked for better cache performance
+    // (not sure if rows in z will be cached)
+#pragma omp parallel for
+    for (int i = 0; i < n_heads; i++) {
+        for (int pos_index = 0; pos_index < pos; pos_index++) {
+            for (int j = 0; j < kqv_dim; j++) {
+                z_m[pos_index][i] += v_m[pos_index][i][j] * kq_m[i][pos_index];
+            }
+        }
+    }
+}
+
+void attention() {
+    // calculate new q, k, v and store k, v in cache
+    b_matvec(q_w, x, q, kqv_dim * n_heads, embed_dim);
+    b_matvec(q_w, x, k_cache + pos * kqv_dim * n_kv_heads, kqv_dim * n_kv_heads, embed_dim);
+    b_matvec(q_w, x, v_cache + pos * kqv_dim * n_kv_heads, kqv_dim * n_kv_heads, embed_dim);
+
+    // rope
+    for (int i = 0; i < n_heads; i++)
+        inplace_rope(q + kqv_dim * i, pos, kqv_dim);
+    for (int i = 0; i < n_kv_heads; i++)
+        inplace_rope(k_cache + pos * kqv_dim * n_kv_heads + kqv_dim * i, pos, kqv_dim);
+
+    // calculate multihead scale for v_cache
+    kq_mul_softmax_fused(q, k_cache, kq, n_heads, n_kv_heads, pos, kqv_dim);
+
+    // calculate z and output
+    scale_v_mul(kq, v_cache, z, n_heads, n_kv_heads, pos, kqv_dim);
+
+    b_matvec(wo, z, x, embed_dim, n_heads * kqv_dim);
 }
 
 int main(int argc, char *argv[]) {
@@ -83,87 +211,12 @@ int main(int argc, char *argv[]) {
 
     omp_set_num_threads(32);
 
-    int d = MATRIX_SIZE;
-    int n = MATRIX_SIZE;
+    // float *w_m = (float *)aligned_alloc(ALIGNMENT, sizeof(float) * d * n);
+    // float *x = (float *)aligned_alloc(ALIGNMENT, sizeof(float) * n);
+    // float *x_out = (float *)aligned_alloc(ALIGNMENT, sizeof(float) * d);
+    // float *x_out_truth = (float *)aligned_alloc(ALIGNMENT, sizeof(float) * d);
 
-    double blocked_time = 0.0;
-    double simd_time = 0.0;
-    double baseline_time = 0.0;
-
-    float16_t *w_m = (float16_t *)aligned_alloc(ALIGNMENT, sizeof(float16_t) * d * n);
-    float16_t *x = (float16_t *)aligned_alloc(ALIGNMENT, sizeof(float16_t) * n);
-    float16_t *x_out = (float16_t *)aligned_alloc(ALIGNMENT, sizeof(float16_t) * d);
-    float16_t *x_out_truth = (float16_t *)aligned_alloc(ALIGNMENT, sizeof(float16_t) * d);
-
-    init_matricies(w_m, d * n);
-    init_matricies(x, n);
-
-    // for (int i = 0; i < d; i++) {
-    //     for (int j = 0; j < n; j++) {
-    //         if (i == j)
-    //             // if (i == n - j - 1)
-    //             // if (i == n - 1)
-    //             w_m[i * n + j] = 1.0f;
-    //         else
-    //             w_m[i * n + j] = 0.0f;
-    //     }
-    //     x[i] = i;
-    // }
-    // print(w_m, d, n);
-    // print(x, 1, d);
-
-    // rearrange w
-    float16_t *w_mT = (float16_t *)aligned_alloc(ALIGNMENT, sizeof(float16_t) * n * d);
-    simd_matrix_t s_w = reinterpret_cast<simd_matrix_t>(*w_mT);
-    int blocksize = 8;
-#pragma omp parallel
-    for (int i = 0; i < d / blocksize; i++)
-        for (int ii = 0; ii < blocksize; ii++)
-            for (int j = 0; j < n / blocksize; j++)
-                for (int jj = 0; jj < blocksize; jj++)
-                    s_w[i][j][jj][ii] = w_m[i * blocksize * n + ii * n + j * blocksize + jj];
-
-    // print(w_mT, 1, d * n);
-    //     float16_t *w_mT = (float16_t *)aligned_alloc(ALIGNMENT, sizeof(float16_t) * n * d);
-    // #pragma omp parallel
-    //     for (int i = 0; i < d; i++)
-    //         for (int j = 0; j < n; j++)
-    //             w_mT[j * d + i] = w_m1[i * n + j];
-
-    for (int i = 0; i < 10; i++) {
-        // clear x_out
-#pragma omp parallel
-        for (int i = 0; i < d; i++)
-            x_out[i] = 0.0;
-
-        timer.start();
-        // matmul_improved(w_m, x, x_out, d, n);
-        // matmul_simd2(s_w, x, x_out, d, n);
-        // matmul_truth(w_m, x, x_out_truth, d, n);
-        simd_time += timer.stop("simd: ");
-
-        matmul_truth(w_m, x, x_out_truth, d, n);
-        // print(x_out, 1, d);
-        // print(x_out_truth, 1, d);
-        float diff = 0.0;
-        float maxval = 0.0;
-
-        // #pragma omp parallel for reduction(max : diff)
-        for (int i = 0; i < d; i++) {
-            diff = std::max(diff, std::abs((float)(x_out_truth[i] - x_out[i])));
-            maxval = std::max(maxval, std::abs((float)x_out_truth[i]));
-            // diff += std::abs(static_cast<float>(x_out_truth[i] - x_out[i]));
-        }
-
-        std::cout << "[max diff: " << diff << "]" << std::endl;
-        std::cout << "[max val: " << maxval << "]" << std::endl;
-        // std::cout << "[avg diff: " << diff / static_cast<float>(d) << "]" << std::endl;
-    }
-
-    std::cout << std::endl;
-    std::cout << "simd total: " << simd_time << std::endl;
-    // std::cout << "blocked total: " << blocked_time << std::endl;
-    // std::cout << "baseline total: " << baseline_time << std::endl;
+    // timer.start();
 
     return 0;
 }
